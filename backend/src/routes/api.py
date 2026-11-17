@@ -3,12 +3,13 @@ import redis
 from fastapi import APIRouter,Depends,HTTPException,Response
 from sqlalchemy.exc import IntegrityError
 from src.config.database import db
-from src.models.entities import User,Reader,Segment,Outreach,Audit
-from src.schemas.business import Login,ReaderInput,SegmentInput,OutreachInput
+from src.models.entities import User,Reader,Segment,Outreach,Audit,ReconBatch
+from src.schemas.business import Login,ReaderInput,SegmentInput,OutreachInput,BatchInput,SettleInput
 from src.middlewares.auth import current,editor,admin
 from src.utils.security import verify,token
 from src.services.business import audit,dump
-from src.controllers.business import ensure_segment
+from src.controllers.business import ensure_segment,ensure_outreach,ensure_batch
+from src.services import recon
 router=APIRouter()
 @router.post('/auth/login')
 def login(data:Login,s=Depends(db)):
@@ -56,7 +57,7 @@ def outreach(data:OutreachInput,u=Depends(editor),s=Depends(db)):
  if r.state!='done':raise HTTPException(409,'分群完成后才能制定触达方案')
  members=[m['code'] for m in r.result['members'] if m['cluster_id']==data.cluster_id]
  if not members:raise HTTPException(422,'该版本没有所选群组')
- o=Outreach(**data.model_dump(),members=members);s.add(o);s.commit();audit(s,u,'起草触达方案 '+str(o.id));return dump(o)
+ o=Outreach(**data.model_dump(),members=members);s.add(o);s.flush();o.root_outreach_id=o.id;s.commit();audit(s,u,'起草触达方案 '+str(o.id));return dump(o)
 @router.post('/outreaches/{i}/approve')
 def approve(i:int,u=Depends(admin),s=Depends(db)):
  r=s.get(Outreach,i)
@@ -70,3 +71,24 @@ def export_outreach(i:int,u=Depends(current),s=Depends(db)):
  return Response(json.dumps(dump(r),ensure_ascii=False,indent=2),media_type='application/json',headers={'Content-Disposition':f'attachment; filename="reader-outreach-{i}.json"'})
 @router.get('/audits')
 def audits(u=Depends(admin),s=Depends(db)):return [dump(r) for r in s.query(Audit).order_by(Audit.id.desc()).limit(100)]
+@router.get('/recon/batches')
+def recon_batches(u=Depends(current),s=Depends(db)):return recon.list_batches(s)
+@router.post('/recon/batches')
+def create_recon(data:BatchInput,u=Depends(editor),s=Depends(db)):
+ o=ensure_outreach(s,data.outreach_id)
+ if o.status!='approved':raise HTTPException(409,'仅已签核方案可建立对账批次')
+ if o.parent_outreach_id is not None:raise HTTPException(409,'补发方案的回执回传原方案的对账批次，不另建批次')
+ if s.query(ReconBatch).filter_by(outreach_id=o.id).first():raise HTTPException(409,'该方案已建立对账批次，请在该批次上继续接收回执')
+ try:return recon.batch_detail(s,recon.create_batch(s,o,data.note,u.email))
+ except IntegrityError:s.rollback();raise HTTPException(409,'该方案已建立对账批次，请在该批次上继续接收回执')
+@router.get('/recon/batches/{i}')
+def recon_detail(i:int,u=Depends(current),s=Depends(db)):return recon.batch_detail(s,ensure_batch(s,i))
+@router.post('/recon/batches/{i}/settle')
+def recon_settle(i:int,data:SettleInput,u=Depends(editor),s=Depends(db)):
+ try:
+  b=ensure_batch(s,i,lock=True)
+  recon.settle(s,b,data.receipts,data.note,u.email)
+ except HTTPException:raise
+ except Exception:
+  s.rollback();raise
+ return recon.batch_detail(s,ensure_batch(s,i))
